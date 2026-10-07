@@ -98,6 +98,8 @@ class ProcurementService:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER NOT NULL REFERENCES tenders(id),
                     vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    consortium_id INTEGER REFERENCES consortiums(id),
+                    consortium_version_id INTEGER REFERENCES consortium_versions(id),
                     payload TEXT NOT NULL,
                     payload_hash TEXT NOT NULL,
                     price REAL NOT NULL,
@@ -107,6 +109,40 @@ class ProcurementService:
                     submitted_at TEXT NOT NULL,
                     opened_at TEXT,
                     UNIQUE(tender_id,vendor_id)
+                );
+                CREATE TABLE IF NOT EXISTS vendor_qualifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    cert_no TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'valid',
+                    valid_until TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(vendor_id,cert_no)
+                );
+                CREATE TABLE IF NOT EXISTS consortiums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    consortium_no TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    lead_vendor_id INTEGER NOT NULL REFERENCES vendors(id),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS consortium_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    consortium_id INTEGER NOT NULL REFERENCES consortiums(id),
+                    version INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    members TEXT NOT NULL,
+                    snapshot_hash TEXT NOT NULL,
+                    change_reason TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    invalidated_at TEXT,
+                    invalid_reason TEXT,
+                    UNIQUE(consortium_id,version)
                 );
                 CREATE TABLE IF NOT EXISTS evaluations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,7 +200,16 @@ class ProcurementService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
+                CREATE INDEX IF NOT EXISTS idx_consortium_versions_active ON consortium_versions(consortium_id,status);
                 """
+            )
+            bid_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bids)")}
+            if "consortium_id" not in bid_columns:
+                conn.execute("ALTER TABLE bids ADD COLUMN consortium_id INTEGER REFERENCES consortiums(id)")
+            if "consortium_version_id" not in bid_columns:
+                conn.execute("ALTER TABLE bids ADD COLUMN consortium_version_id INTEGER REFERENCES consortium_versions(id)")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_bids_tender_consortium ON bids(tender_id,consortium_id) WHERE consortium_id IS NOT NULL"
             )
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
@@ -196,6 +241,275 @@ class ProcurementService:
                 raise DomainError("供应商编号已存在", 409) from exc
             self._audit(conn, None, actor, "vendor.created", {"vendor_no": vendor_no.strip()})
             return dict(conn.execute("SELECT * FROM vendors WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def register_qualification(self, actor: str, role: str, vendor_id: int, cert_no: str,
+                               name: str, valid_until: str) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "登记资质证书")
+        if not cert_no.strip() or not name.strip():
+            raise DomainError("证书编号和名称不能为空")
+        expiry = parse_time(valid_until)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM vendors WHERE id=?", (vendor_id,)).fetchone():
+                raise DomainError("供应商不存在", 404)
+            now = utcnow()
+            conn.execute(
+                """INSERT INTO vendor_qualifications(vendor_id,cert_no,name,valid_until,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(vendor_id,cert_no) DO UPDATE SET name=excluded.name,status='valid',
+                       valid_until=excluded.valid_until,updated_at=excluded.updated_at""",
+                (vendor_id, cert_no.strip(), name.strip(), expiry.isoformat(timespec="seconds"), now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM vendor_qualifications WHERE vendor_id=? AND cert_no=?",
+                (vendor_id, cert_no.strip()),
+            ).fetchone()
+            self._audit(conn, None, actor, "qualification.registered",
+                        {"vendor_id": vendor_id, "cert_no": cert_no.strip(), "valid_until": row["valid_until"]})
+            return dict(row)
+
+    def set_qualification_status(self, actor: str, role: str, qualification_id: int,
+                                 status: str, reason: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "变更资质状态")
+        if status not in {"valid", "suspended", "expired"}:
+            raise DomainError("资质状态只支持 valid、suspended、expired")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            qual = conn.execute("SELECT * FROM vendor_qualifications WHERE id=?", (qualification_id,)).fetchone()
+            if not qual:
+                raise DomainError("资质证书不存在", 404)
+            if qual["status"] == status:
+                return dict(qual)
+            conn.execute("UPDATE vendor_qualifications SET status=?,updated_at=? WHERE id=?",
+                         (status, utcnow(), qualification_id))
+            self._audit(conn, None, actor, "qualification.status_changed",
+                        {"qualification_id": qualification_id, "vendor_id": qual["vendor_id"],
+                         "cert_no": qual["cert_no"], "status": status, "reason": reason.strip()})
+            if status in {"suspended", "expired"}:
+                # 成员证书过期或资格暂停时，包含该成员的联合体原版本也失效
+                label = "暂停" if status == "suspended" else "过期"
+                for version in conn.execute("SELECT * FROM consortium_versions WHERE status='active'").fetchall():
+                    members = json.loads(version["members"])
+                    if any(m["vendor_id"] == qual["vendor_id"] for m in members):
+                        self._invalidate_version(conn, version, "invalid",
+                                                 "成员证书%s：%s" % (label, qual["cert_no"]), actor)
+            return dict(conn.execute("SELECT * FROM vendor_qualifications WHERE id=?", (qualification_id,)).fetchone())
+
+    def _normalize_members(self, conn: sqlite3.Connection, members: Any) -> list[dict[str, Any]]:
+        if not isinstance(members, list) or not members:
+            raise DomainError("联合体成员不能为空")
+        normalized = []
+        seen = set()
+        total = Decimal("0")
+        now = datetime.now(timezone.utc)
+        for item in members:
+            if not isinstance(item, dict):
+                raise DomainError("联合体成员格式无效")
+            try:
+                vendor_id = int(item["vendor_id"])
+                share = Decimal(str(item["share"]))
+            except (KeyError, TypeError, InvalidOperation) as exc:
+                raise DomainError("联合体成员或份额无效") from exc
+            if vendor_id in seen:
+                raise DomainError("联合体成员重复：%s" % vendor_id)
+            seen.add(vendor_id)
+            if share <= 0:
+                raise DomainError("成员份额必须大于0")
+            vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
+            if not vendor:
+                raise DomainError("成员供应商不存在：%s" % vendor_id, 404)
+            qualifications = [dict(r) for r in conn.execute(
+                "SELECT cert_no,name,status,valid_until FROM vendor_qualifications WHERE vendor_id=? ORDER BY cert_no",
+                (vendor_id,),
+            ).fetchall()]
+            for qual in qualifications:
+                if qual["status"] != "valid":
+                    raise DomainError("成员 %s 的证书 %s 当前不可用" % (vendor["name"], qual["cert_no"]), 409)
+                if parse_time(qual["valid_until"]) <= now:
+                    raise DomainError("成员 %s 的证书 %s 已过期" % (vendor["name"], qual["cert_no"]), 409)
+            total += share
+            normalized.append({"vendor_id": vendor_id, "vendor_no": vendor["vendor_no"], "name": vendor["name"],
+                               "share": float(share), "qualifications": qualifications})
+        if total != 100:
+            raise DomainError("成员份额合计必须等于100")
+        return normalized
+
+    @staticmethod
+    def _same_members(frozen: list[dict[str, Any]], normalized: list[dict[str, Any]]) -> bool:
+        current = sorted((m["vendor_id"], m["share"]) for m in frozen)
+        incoming = sorted((m["vendor_id"], m["share"]) for m in normalized)
+        return current == incoming
+
+    def _insert_version(self, conn: sqlite3.Connection, consortium_id: int, version: int,
+                        members: list[dict[str, Any]], lead_vendor_id: int, actor: str, reason: str) -> int:
+        snapshot = {"consortium_id": consortium_id, "version": version,
+                    "lead_vendor_id": lead_vendor_id, "members": members}
+        digest = canonical_hash(snapshot)
+        cur = conn.execute(
+            """INSERT INTO consortium_versions(consortium_id,version,members,snapshot_hash,change_reason,created_by,created_at)
+               VALUES(?,?,?,?,?,?,?)""",
+            (consortium_id, version, json.dumps(members, ensure_ascii=False, sort_keys=True), digest,
+             reason.strip(), actor, utcnow()),
+        )
+        return cur.lastrowid
+
+    def _invalidate_version(self, conn: sqlite3.Connection, version: sqlite3.Row,
+                            status: str, reason: str, actor: str) -> None:
+        conn.execute(
+            "UPDATE consortium_versions SET status=?,invalidated_at=?,invalid_reason=? WHERE id=? AND status='active'",
+            (status, utcnow(), reason, version["id"]),
+        )
+        affected = []
+        for bid in conn.execute("SELECT * FROM bids WHERE consortium_version_id=?", (version["id"],)).fetchall():
+            if bid["status"] == "sealed":
+                # 未开标：联合体整组失效
+                conn.execute("UPDATE bids SET status='invalid',version=version+1 WHERE id=?", (bid["id"],))
+                self._audit(conn, bid["tender_id"], actor, "bid.invalidated",
+                            {"bid_id": bid["id"], "consortium_version": version["version"], "reason": reason})
+                affected.append({"bid_id": bid["id"], "tender_id": bid["tender_id"], "effect": "invalid"})
+            elif bid["status"] in {"opened", "qualified"}:
+                # 已开标：保留原快照，拦截评分与授标
+                self._audit(conn, bid["tender_id"], actor, "bid.blocked",
+                            {"bid_id": bid["id"], "consortium_version": version["version"], "reason": reason})
+                affected.append({"bid_id": bid["id"], "tender_id": bid["tender_id"], "effect": "blocked"})
+        self._audit(conn, None, actor, "consortium.version_invalidated",
+                    {"consortium_id": version["consortium_id"], "version": version["version"],
+                     "status": status, "reason": reason, "affected_bids": affected})
+
+    def _sweep_version_validity(self, conn: sqlite3.Connection) -> None:
+        now = datetime.now(timezone.utc)
+        for version in conn.execute("SELECT * FROM consortium_versions WHERE status='active'").fetchall():
+            reason = ""
+            for member in json.loads(version["members"]):
+                for qual in member.get("qualifications", []):
+                    current = conn.execute(
+                        "SELECT status,valid_until FROM vendor_qualifications WHERE vendor_id=? AND cert_no=?",
+                        (member["vendor_id"], qual["cert_no"]),
+                    ).fetchone()
+                    if not current:
+                        reason = "成员证书缺失：%s" % qual["cert_no"]
+                    elif current["status"] == "suspended":
+                        reason = "成员证书暂停：%s" % qual["cert_no"]
+                    elif current["status"] != "valid":
+                        reason = "成员证书失效：%s" % qual["cert_no"]
+                    elif parse_time(current["valid_until"]) <= now:
+                        reason = "成员证书过期：%s" % qual["cert_no"]
+                    if reason:
+                        break
+                if reason:
+                    break
+            if reason:
+                self._invalidate_version(conn, version, "invalid", reason, "system")
+
+    def create_consortium(self, actor: str, role: str, consortium_no: str, name: str,
+                          lead_vendor_id: int, members: list[dict[str, Any]]) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor", "procurement"}, "创建联合体")
+        if not consortium_no.strip() or not name.strip():
+            raise DomainError("联合体编号和名称不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            normalized = self._normalize_members(conn, members)
+            lead_vendor_id = int(lead_vendor_id)
+            if lead_vendor_id not in {m["vendor_id"] for m in normalized}:
+                raise DomainError("牵头方必须是联合体成员")
+            existing = conn.execute("SELECT * FROM consortiums WHERE consortium_no=?", (consortium_no.strip(),)).fetchone()
+            if existing:
+                latest = conn.execute(
+                    "SELECT * FROM consortium_versions WHERE consortium_id=? ORDER BY version DESC LIMIT 1",
+                    (existing["id"],),
+                ).fetchone()
+                if existing["lead_vendor_id"] == lead_vendor_id and self._same_members(json.loads(latest["members"]), normalized):
+                    # 重复提交只留一条
+                    return self._consortium_view(conn, existing)
+                raise DomainError("联合体编号已存在，成员变更请通过修订生成新版本", 409)
+            now = utcnow()
+            cur = conn.execute(
+                "INSERT INTO consortiums(consortium_no,name,lead_vendor_id,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                (consortium_no.strip(), name.strip(), lead_vendor_id, actor, now, now),
+            )
+            consortium_id = cur.lastrowid
+            self._insert_version(conn, consortium_id, 1, normalized, lead_vendor_id, actor, "初始组成")
+            self._audit(conn, None, actor, "consortium.created",
+                        {"consortium_id": consortium_id, "consortium_no": consortium_no.strip(), "version": 1,
+                         "members": [{"vendor_id": m["vendor_id"], "share": m["share"]} for m in normalized]})
+            consortium = conn.execute("SELECT * FROM consortiums WHERE id=?", (consortium_id,)).fetchone()
+            return self._consortium_view(conn, consortium)
+
+    def revise_consortium(self, actor: str, role: str, consortium_id: int, members: list[dict[str, Any]],
+                          reason: str, lead_vendor_id: int | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor", "procurement"}, "变更联合体成员")
+        if not reason.strip():
+            raise DomainError("变更原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_version_validity(conn)
+            consortium = conn.execute("SELECT * FROM consortiums WHERE id=?", (consortium_id,)).fetchone()
+            if not consortium:
+                raise DomainError("联合体不存在", 404)
+            normalized = self._normalize_members(conn, members)
+            lead = int(lead_vendor_id) if lead_vendor_id is not None else consortium["lead_vendor_id"]
+            if lead not in {m["vendor_id"] for m in normalized}:
+                raise DomainError("牵头方必须是联合体成员")
+            current = conn.execute(
+                "SELECT * FROM consortium_versions WHERE consortium_id=? AND status='active' ORDER BY version DESC LIMIT 1",
+                (consortium_id,),
+            ).fetchone()
+            if current and lead == consortium["lead_vendor_id"] and self._same_members(json.loads(current["members"]), normalized):
+                raise DomainError("成员未发生变化，不能生成新版本", 409)
+            next_version = conn.execute(
+                "SELECT COALESCE(MAX(version),0)+1 AS v FROM consortium_versions WHERE consortium_id=?",
+                (consortium_id,),
+            ).fetchone()["v"]
+            if current:
+                # 成员变更只生成新版本，原投标和承诺哈希保持不改写
+                self._invalidate_version(conn, current, "superseded", "成员变更：%s" % reason.strip(), actor)
+            if lead != consortium["lead_vendor_id"]:
+                conn.execute("UPDATE consortiums SET lead_vendor_id=?,updated_at=? WHERE id=?",
+                             (lead, utcnow(), consortium_id))
+            self._insert_version(conn, consortium_id, next_version, normalized, lead, actor, reason)
+            self._audit(conn, None, actor, "consortium.revised",
+                        {"consortium_id": consortium_id, "version": next_version,
+                         "superseded_version": current["version"] if current else None,
+                         "members": [{"vendor_id": m["vendor_id"], "share": m["share"]} for m in normalized]})
+            consortium = conn.execute("SELECT * FROM consortiums WHERE id=?", (consortium_id,)).fetchone()
+            return self._consortium_view(conn, consortium)
+
+    def _consortium_view(self, conn: sqlite3.Connection, consortium: sqlite3.Row) -> dict[str, Any]:
+        item = dict(consortium)
+        lead = conn.execute("SELECT id,vendor_no,name FROM vendors WHERE id=?", (item["lead_vendor_id"],)).fetchone()
+        item["lead_vendor"] = dict(lead) if lead else None
+        versions = []
+        for row in conn.execute(
+            "SELECT * FROM consortium_versions WHERE consortium_id=? ORDER BY version DESC", (item["id"],)
+        ).fetchall():
+            version = dict(row)
+            members = json.loads(version["members"])
+            for member in members:
+                for qual in member.get("qualifications", []):
+                    current = conn.execute(
+                        "SELECT status FROM vendor_qualifications WHERE vendor_id=? AND cert_no=?",
+                        (member["vendor_id"], qual["cert_no"]),
+                    ).fetchone()
+                    qual["current_status"] = current["status"] if current else "missing"
+            version["members"] = members
+            version["affected_bids"] = [dict(b) for b in conn.execute(
+                "SELECT id,tender_id,status FROM bids WHERE consortium_version_id=? ORDER BY id", (version["id"],)
+            ).fetchall()]
+            versions.append(version)
+        item["versions"] = versions
+        return item
+
+    def get_consortium(self, actor: str, role: str, consortium_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            self._sweep_version_validity(conn)
+            consortium = conn.execute("SELECT * FROM consortiums WHERE id=?", (consortium_id,)).fetchone()
+            if not consortium:
+                raise DomainError("联合体不存在", 404)
+            return self._consortium_view(conn, consortium)
 
     def create_tender(self, actor: str, role: str, tender_no: str, title: str,
                       deadline: str, criteria: list[dict[str, Any]], description: str = "") -> dict[str, Any]:
@@ -252,7 +566,8 @@ class ProcurementService:
             return dict(self._tender(conn, tender_id))
 
     def submit_bid(self, actor: str, role: str, tender_id: int, vendor_id: int,
-                   payload: dict[str, Any], price: float, expected_version: int | None = None) -> dict[str, Any]:
+                   payload: dict[str, Any], price: float, expected_version: int | None = None,
+                   consortium_id: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"vendor"}, "提交投标")
         if not isinstance(payload, dict):
@@ -265,6 +580,7 @@ class ProcurementService:
             raise DomainError("报价必须大于0")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._sweep_version_validity(conn)
             tender = self._tender(conn, tender_id)
             if tender["status"] != "published":
                 raise DomainError("当前项目不接受投标", 409)
@@ -273,31 +589,76 @@ class ProcurementService:
             vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
             if not vendor:
                 raise DomainError("供应商不存在", 404)
-            if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
-                pass
-            existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
+            version_row = None
+            if consortium_id is not None:
+                consortium_id = int(consortium_id)
+                consortium = conn.execute("SELECT * FROM consortiums WHERE id=?", (consortium_id,)).fetchone()
+                if not consortium:
+                    raise DomainError("联合体不存在", 404)
+                if consortium["lead_vendor_id"] != vendor_id:
+                    raise DomainError("联合体投标必须由牵头方提交", 403)
+                version_row = conn.execute(
+                    "SELECT * FROM consortium_versions WHERE consortium_id=? AND status='active' ORDER BY version DESC LIMIT 1",
+                    (consortium_id,),
+                ).fetchone()
+                if not version_row:
+                    raise DomainError("联合体当前版本已失效，不能投标", 409)
+            if consortium_id is not None:
+                existing = conn.execute(
+                    "SELECT * FROM bids WHERE tender_id=? AND consortium_id=?", (tender_id, consortium_id)
+                ).fetchone()
+                clash = conn.execute(
+                    "SELECT 1 FROM bids WHERE tender_id=? AND vendor_id=? AND (consortium_id IS NULL OR consortium_id!=?)",
+                    (tender_id, vendor_id, consortium_id),
+                ).fetchone()
+                if clash:
+                    raise DomainError("投标主体与已存投标不一致，请先撤回", 409)
+            else:
+                existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
+                if existing and existing["consortium_id"] is not None:
+                    raise DomainError("投标主体与已存投标不一致，请先撤回", 409)
             payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             digest = canonical_hash(payload)
             if existing:
-                if existing["status"] != "sealed":
+                if existing["status"] == "invalid" and version_row is not None:
+                    # 联合体版本失效后按新版本重新提交，仍只保留一条记录
+                    conn.execute(
+                        """UPDATE bids SET vendor_id=?,payload=?,payload_hash=?,price=?,status='sealed',consortium_version_id=?,
+                           version=version+1,submitted_by=?,submitted_at=?,opened_at=NULL WHERE id=?""",
+                        (vendor_id, payload_text, digest, price, version_row["id"], actor, utcnow(), existing["id"]),
+                    )
+                    bid_id = existing["id"]
+                    action = "bid.resubmitted"
+                elif existing["status"] != "sealed":
                     raise DomainError("投标已撤回或已开标，不能修改", 409)
-                if expected_version is None or existing["version"] != int(expected_version):
-                    raise DomainError("投标已变化，请刷新后重试", 409)
-                conn.execute(
-                    "UPDATE bids SET payload=?,payload_hash=?,price=?,version=version+1,submitted_at=? WHERE id=? AND version=?",
-                    (payload_text, digest, price, utcnow(), existing["id"], expected_version),
-                )
-                bid_id = existing["id"]
-                action = "bid.updated"
+                elif version_row is not None and existing["payload_hash"] == digest \
+                        and existing["price"] == price and existing["consortium_version_id"] == version_row["id"]:
+                    # 重复提交只留一条：内容完全一致直接返回原记录
+                    return dict(conn.execute("SELECT * FROM bids WHERE id=?", (existing["id"],)).fetchone())
+                else:
+                    if expected_version is None or existing["version"] != int(expected_version):
+                        raise DomainError("投标已变化，请刷新后重试", 409)
+                    new_version_id = version_row["id"] if version_row is not None else existing["consortium_version_id"]
+                    conn.execute(
+                        "UPDATE bids SET vendor_id=?,payload=?,payload_hash=?,price=?,consortium_version_id=?,version=version+1,submitted_at=? WHERE id=? AND version=?",
+                        (vendor_id, payload_text, digest, price, new_version_id, utcnow(), existing["id"], expected_version),
+                    )
+                    bid_id = existing["id"]
+                    action = "bid.updated"
             else:
                 cur = conn.execute(
-                    """INSERT INTO bids(tender_id,vendor_id,payload,payload_hash,price,submitted_by,submitted_at)
-                       VALUES(?,?,?,?,?,?,?)""",
-                    (tender_id, vendor_id, payload_text, digest, price, actor, utcnow()),
+                    """INSERT INTO bids(tender_id,vendor_id,consortium_id,consortium_version_id,payload,payload_hash,price,submitted_by,submitted_at)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (tender_id, vendor_id, consortium_id, version_row["id"] if version_row else None,
+                     payload_text, digest, price, actor, utcnow()),
                 )
                 bid_id = cur.lastrowid
                 action = "bid.submitted"
-            self._audit(conn, tender_id, actor, action, {"bid_id": bid_id, "vendor_id": vendor_id, "hash": digest})
+            details = {"bid_id": bid_id, "vendor_id": vendor_id, "hash": digest}
+            if version_row is not None:
+                details["consortium_id"] = consortium_id
+                details["consortium_version"] = version_row["version"]
+            self._audit(conn, tender_id, actor, action, details)
             bid = dict(conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone())
             bid["payload_hash"] = digest
             return bid
@@ -326,6 +687,7 @@ class ProcurementService:
         require_role(role, {"procurement", "supervisor"}, "开标")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._sweep_version_validity(conn)
             tender = self._tender(conn, tender_id)
             if tender["status"] != "published":
                 raise DomainError("项目当前不能开标", 409)
@@ -370,6 +732,7 @@ class ProcurementService:
         require_role(role, {"evaluator"}, "评分")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._sweep_version_validity(conn)
             bid = conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone()
             if not bid:
                 raise DomainError("投标不存在", 404)
@@ -378,6 +741,12 @@ class ProcurementService:
                 raise DomainError("当前项目不能评分", 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("该投标不能评分", 409)
+            if bid["consortium_version_id"]:
+                version = conn.execute(
+                    "SELECT status FROM consortium_versions WHERE id=?", (bid["consortium_version_id"],)
+                ).fetchone()
+                if not version or version["status"] != "active":
+                    raise DomainError("联合体版本已失效，该投标不能评分", 409)
             conflict = conn.execute(
                 "SELECT 1 FROM conflicts WHERE tender_id=? AND evaluator=? AND (vendor_id=? OR vendor_id IS NULL)",
                 (tender["id"], actor, bid["vendor_id"]),
@@ -519,6 +888,7 @@ class ProcurementService:
         require_role(role, {"supervisor"}, "授标")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            self._sweep_version_validity(conn)
             tender = self._tender(conn, tender_id)
             if tender["status"] not in {"opened", "reevaluation"}:
                 raise DomainError("当前项目不能授标", 409)
@@ -531,7 +901,18 @@ class ProcurementService:
             criteria = json.loads(tender["criteria"])
             expected_criteria = {c["name"] for c in criteria}
             ranking = []
+            excluded = []
             for bid in bids:
+                if bid["consortium_version_id"]:
+                    version = conn.execute(
+                        "SELECT version,status FROM consortium_versions WHERE id=?", (bid["consortium_version_id"],)
+                    ).fetchone()
+                    if not version or version["status"] != "active":
+                        # 已开标联合体保留原快照，但拦截授标
+                        excluded.append({"bid_id": bid["id"],
+                                         "consortium_version": version["version"] if version else None,
+                                         "reason": "联合体版本已失效"})
+                        continue
                 rows = conn.execute(
                     "SELECT criterion,AVG(score) AS score FROM evaluations WHERE bid_id=? AND evaluation_round=? GROUP BY criterion",
                     (bid["id"], tender["evaluation_round"]),
@@ -547,25 +928,36 @@ class ProcurementService:
                 raise DomainError("没有可授标的有效投标", 409)
             ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking,
+                        "excluded_bids": excluded, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
-            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
+            self._audit(conn, tender_id, actor, "tender.awarded",
+                        {"winner": winner, "ranking": ranking, "excluded_bids": excluded})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
+            self._sweep_version_validity(conn)
             tender = dict(self._tender(conn, tender_id))
             bids = []
             if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
-                bids = [dict(r) for r in conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()]
+                bids = [dict(r) for r in conn.execute(
+                    """SELECT b.*,cv.version AS consortium_version,cv.status AS consortium_version_status
+                       FROM bids b LEFT JOIN consortium_versions cv ON cv.id=b.consortium_version_id
+                       WHERE b.tender_id=? ORDER BY b.id""",
+                    (tender_id,),
+                ).fetchall()]
             elif role == "vendor":
                 bids = []
                 for row in conn.execute(
-                    "SELECT b.*,t.status AS tender_status FROM bids b JOIN tenders t ON t.id=b.tender_id WHERE b.tender_id=? AND b.submitted_by=?",
+                    """SELECT b.*,t.status AS tender_status,cv.version AS consortium_version,cv.status AS consortium_version_status
+                       FROM bids b JOIN tenders t ON t.id=b.tender_id
+                       LEFT JOIN consortium_versions cv ON cv.id=b.consortium_version_id
+                       WHERE b.tender_id=? AND b.submitted_by=?""",
                     (tender_id, actor),
                 ).fetchall():
                     item = dict(row)
@@ -575,7 +967,10 @@ class ProcurementService:
                     bids.append(item)
             else:
                 bids = [dict(r) for r in conn.execute(
-                    "SELECT id,tender_id,vendor_id,price,status,payload_hash,submitted_at,opened_at FROM bids WHERE tender_id=? ORDER BY id",
+                    """SELECT b.id,b.tender_id,b.vendor_id,b.consortium_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                              cv.version AS consortium_version
+                       FROM bids b LEFT JOIN consortium_versions cv ON cv.id=b.consortium_version_id
+                       WHERE b.tender_id=? ORDER BY b.id""",
                     (tender_id,),
                 ).fetchall()]
             clarifications = [dict(r) for r in conn.execute(
@@ -586,21 +981,27 @@ class ProcurementService:
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
+            self._sweep_version_validity(conn)
             tenders = [dict(r) for r in conn.execute(
                 "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
             ).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
                 bids = [dict(r) for r in conn.execute(
-                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                    """SELECT b.id,b.tender_id,b.vendor_id,b.consortium_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                              cv.version AS consortium_version,cv.status AS consortium_version_status,
                               CASE WHEN t.status IN ('opened','reevaluation','awarded') THEN b.payload ELSE NULL END AS payload
-                       FROM bids b JOIN tenders t ON t.id=b.tender_id ORDER BY b.id DESC LIMIT 200"""
+                       FROM bids b JOIN tenders t ON t.id=b.tender_id
+                       LEFT JOIN consortium_versions cv ON cv.id=b.consortium_version_id
+                       ORDER BY b.id DESC LIMIT 200"""
                 ).fetchall()]
                 complaints = [dict(r) for r in conn.execute("SELECT * FROM complaints ORDER BY id DESC LIMIT 100").fetchall()]
             elif role == "vendor":
                 bids = []
                 for row in conn.execute(
-                    """SELECT b.*,t.status AS tender_status FROM bids b JOIN tenders t ON t.id=b.tender_id
+                    """SELECT b.*,t.status AS tender_status,cv.version AS consortium_version,cv.status AS consortium_version_status
+                       FROM bids b JOIN tenders t ON t.id=b.tender_id
+                       LEFT JOIN consortium_versions cv ON cv.id=b.consortium_version_id
                        WHERE b.submitted_by=? ORDER BY b.id DESC LIMIT 100""",
                     (actor,),
                 ).fetchall():
@@ -614,7 +1015,11 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            consortiums = [self._consortium_view(conn, row) for row in conn.execute(
+                "SELECT * FROM consortiums ORDER BY id DESC LIMIT 100"
+            ).fetchall()]
+        return {"tenders": tenders, "bids": bids, "complaints": complaints,
+                "consortiums": consortiums, "timeline": timeline, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -629,7 +1034,25 @@ class ProcurementService:
         )
         published = self.publish_tender("proc-demo", "procurement", tender["id"], tender["version"])
         self.submit_bid("vendor-demo", "vendor", tender["id"], vendor["id"], {"价格": 900000, "质量": 90}, 900000)
-        return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"], "published_version": published["version"]}
+        partner = self.create_vendor("proc-demo", "procurement", "V-002", "远山系统", "vendor2-demo")
+        cert_valid = (datetime.now(timezone.utc) + __import__("datetime").timedelta(days=180)).isoformat(timespec="seconds")
+        self.register_qualification("proc-demo", "procurement", vendor["id"], "CERT-QM-001", "质量管理体系认证", cert_valid)
+        self.register_qualification("proc-demo", "procurement", partner["id"], "CERT-SA-002", "安全生产许可", cert_valid)
+        consortium = self.create_consortium(
+            "vendor2-demo", "vendor", "C-DEMO", "远山-启明联合体", partner["id"],
+            [{"vendor_id": partner["id"], "share": 60}, {"vendor_id": vendor["id"], "share": 40}],
+        )
+        joint_tender = self.create_tender(
+            "proc-demo", "procurement", "TENDER-DEMO-2", "云平台建设", deadline,
+            [{"name": "价格", "weight": 60, "kind": "cost", "max_value": 1000000},
+             {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100}],
+        )
+        self.publish_tender("proc-demo", "procurement", joint_tender["id"], joint_tender["version"])
+        self.submit_bid("vendor2-demo", "vendor", joint_tender["id"], partner["id"],
+                        {"价格": 1200000, "质量": 88}, 1200000, consortium_id=consortium["id"])
+        return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"],
+                "published_version": published["version"], "consortium_id": consortium["id"],
+                "joint_tender_id": joint_tender["id"]}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -678,6 +1101,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, self.service.state(actor, role))
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
+            elif path.startswith("/api/consortiums/"):
+                self._send(200, self.service.get_consortium(actor, role, int(path.split("/")[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
@@ -690,6 +1115,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             path, data, (actor, role) = urlparse(self.path).path, self._json(), self._headers()
             if path == "/api/vendors":
                 result = self.service.create_vendor(actor, role, **data)
+            elif path == "/api/vendors/qualifications":
+                result = self.service.register_qualification(actor, role, **data)
+            elif path == "/api/vendors/qualifications/status":
+                result = self.service.set_qualification_status(actor, role, **data)
+            elif path == "/api/consortiums":
+                result = self.service.create_consortium(actor, role, **data)
+            elif path == "/api/consortiums/revise":
+                result = self.service.revise_consortium(actor, role, **data)
             elif path == "/api/tenders":
                 result = self.service.create_tender(actor, role, **data)
             elif path == "/api/tenders/publish":
