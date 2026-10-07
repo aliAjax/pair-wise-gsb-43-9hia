@@ -1,6 +1,31 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>公共采购密封投标</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}</style>
-<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:28px auto;padding:0 20px;color:#28343e}table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d5dde3;padding:7px;vertical-align:top}th{background:#eef4f7}.card{background:#eef8f3;border-left:5px solid #23845b;padding:12px 16px}code{background:#edf0f2;padding:2px 5px}.ok{color:#1a7f4b;font-weight:600}.bad{color:#b3261e;font-weight:600}.muted{color:#6a7883;font-size:13px}.rolebar{margin:12px 0}select,input{font:inherit;padding:3px 6px}.members{font-size:13px}</style>
+<h1>公共采购密封投标与评审</h1><div class="card">公开页面只展示项目元数据，投标正文按角色和执行阶段隐藏。联合体按<b>版本</b>冻结牵头方、成员份额与资质快照；成员退出、资质暂停或证书过期时，未开标投标整组失效，已开标保留快照并拦截评分与授标。写接口需要 <code>X-User</code>、<code>X-Role</code>。</div>
+<div class="rolebar">查看角色：<select id="role"><option value="public">public</option><option value="procurement">procurement</option><option value="supervisor">supervisor</option><option value="auditor">auditor</option><option value="vendor">vendor</option><option value="evaluator">evaluator</option></select> <span class="muted" id="hint"></span></div>
 <h2>采购项目</h2><table id="tenders"><thead><tr><th>编号</th><th>标题</th><th>状态</th><th>截止时间</th><th>评审轮次</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${r.tender_no}</td><td>${r.title}</td><td>${r.status}</td><td>${r.deadline}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>`<tr><td>${r.tender_id}</td><td>${r.vendor_id}</td><td>${r.price}</td><td>${r.status}</td><td>${r.payload_hash.slice(0,12)}…</td></tr>`).join('')}load()</script></html>
+<h2>联合体版本（成员 / 份额 / 资质快照 / 受影响投标）</h2><table id="consortia"><thead><tr><th>编号</th><th>版本</th><th>牵头方</th><th>成员与份额（冻结快照 → 当前资质）</th><th>结构状态</th><th>有效性</th><th>受影响投标</th><th>快照哈希</th></tr></thead><tbody></tbody></table>
+<h2>投标元数据</h2><table id="bids"><thead><tr><th>项目</th><th>供应商</th><th>联合体版本</th><th>报价</th><th>状态</th><th>承诺哈希</th></tr></thead><tbody></tbody></table>
+<script>
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function qstate(m){const cls=m.qualification_status==='valid'?'ok':'bad';const extra=m.qualification_reason?`（${esc(m.qualification_reason)}）`:'';return `<span class="${cls}">${esc(m.qualification_status)}</span>${extra}`}
+function frozen(m){const f=m.frozen||{};return `证书 ${esc(f.cert_no||'未登记')}${f.frozen_cert_valid?'':' 冻结时已失效'}${f.frozen_suspended?' 冻结时已暂停':''}`}
+async function load(){
+ const role=document.querySelector('#role').value;
+ const d=await fetch('/api/state',{headers:{'X-Role':role,'X-User':'proc1'}}).then(r=>r.json());
+ document.querySelector('#hint').textContent = d.consortia && d.consortia.length ? '' : '当前角色可见的联合体版本将显示在此处';
+ document.querySelector('#tenders tbody').innerHTML=d.tenders.map(r=>`<tr><td>${esc(r.tender_no)}</td><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(r.deadline)}</td><td>${r.evaluation_round}</td><td>${r.version}</td></tr>`).join('');
+ document.querySelector('#consortia tbody').innerHTML=(d.consortia||[]).map(c=>`<tr>
+  <td>${esc(c.consortium_no)}</td><td>v${c.version}</td>
+  <td>#${c.lead_vendor_id} ${esc((c.members.find(m=>m.role==='lead')||{}).name||'')}</td>
+  <td class="members">${c.members.map(m=>`<div>#${m.vendor_id} ${esc(m.name)} · 份额 ${m.share}% · <span class="muted">${frozen(m)}</span> → ${qstate(m)}</div>`).join('')}</td>
+  <td>${esc(c.status)}</td>
+  <td>${c.effective?'<span class="ok">有效</span>':`<span class="bad">失效</span><div class="muted">${esc(c.invalid_reason||'')}</div>`}</td>
+  <td class="muted">${c.affected_bids.map(b=>`#${b.id}(${esc(b.status)})`).join('，')||'—'}</td>
+  <td><code>${esc((c.snapshot_hash||'').slice(0,12))}…</code></td></tr>`).join('');
+ document.querySelector('#bids tbody').innerHTML=d.bids.map(r=>{
+   const c=r.consortium;
+   const ccell=c?`<a href="/api/consortia/${c.consortium_id}">${esc(c.consortium_no)} v${c.version}</a> ${c.effective?'<span class="ok">有效</span>':`<span class="bad">失效</span>`}`:'<span class="muted">独立投标</span>';
+   return `<tr><td>${r.tender_id}</td><td>#${r.vendor_id}</td><td>${ccell}</td><td>${r.price}</td><td>${esc(r.status)}</td><td><code>${esc(r.payload_hash.slice(0,12))}…</code></td></tr>`}).join('');
+}
+document.querySelector('#role').addEventListener('change',load);load();
+</script></html>
